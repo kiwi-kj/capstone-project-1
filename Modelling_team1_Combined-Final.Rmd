@@ -1,0 +1,993 @@
+---
+title: "Home Credit Default Risk"
+subtitle: "Modeling"
+author: "Roman Brock, Che Diaz Fadel, Kalyani Joshi, and Chris Porter"
+output: 
+  html_document:
+    number_sections: yes
+    toc: yes
+    fig_width: 15
+    fig_height: 10
+    highlight: tango
+    df_print: paged
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Set options ----
+options(tibble.print_max = 40,
+        tibble.print_min = 24,
+        width = 222,
+        pillar.min_title_chars = 15)
+
+app_train1 <- readRDS('app_train1.RDS')
+app_train2 <- readRDS('app_train2.RDS')
+```
+
+# Introduction  
+Unbanked individuals represent both an underserved demographic as well as a typically untapped market by reputable creditors. Home Credit seeks to fill this gap in service. There are unique challenges that accompany establishing creditworthiness among a population that by definition has little to no financial history, verifiable assets, or traditional means to qualify for a loan.
+
+## Project Scope
+This project will utilize machine learning algorithms to develop a classification model which will use available data about Home Credit customers to improve prediction of those that are likely to repay loans granted by Home Credit. The team will test a number of possible classification models in order to develop the most accurate model on data outside the training data. A successful model will provide greater perfomance in terms of limiting Type II errors, than a simple prediction based upon majority class statistics and will allow Home Credit to loan to customers with confidence that repayment will in return grow available assets to the company in order to further its mission of providing credit to the underserved.
+
+The dataset was previously explored and was determined to be suitable for data modelling purposes.  In this notebook we document the various modeling strategies explored as well as any included data preparation undertaken prior to modeling.  We then compare the various models performance and report our results.
+
+# Data Preparation
+## Load Libraries
+```{r libraries}
+# xgBoost dependencies
+library(tidyverse)
+library(gmodels)
+library(caret)
+library(mlr)
+library(xgboost)
+library(parallel)
+library(parallelMap)
+library(ggplot2)
+library(pROC)
+library(skimr)
+library(randomForest)
+library(ROCR)
+library(ROSE)
+library(mlr)
+```
+## Standardized Data Set Preparation
+In accordance with the information detailed in our previous EDA notebook, we created a standardized data set that utilized the same variables for all models.
+```{r standardized data sets, echo=TRUE, eval=FALSE}
+# Load data ----
+app_train <- read_csv("../data/application_train.csv")
+
+bureau_df <- read_csv("../data/bureau.csv")
+
+desired_columns <- read_csv("desired_columns.csv")
+
+# Identify numerically encoded categorical variables ----
+num2fac <- app_train %>%
+  select(where(is.numeric)) %>%
+  mutate(across(everything(), as.character)) %>%
+  select(where(~ all(!grepl("\\.|-", .)))) %>%
+  #select(-c(own_car_age, hour_appr_process_start, matches("^(obs|def|amt|cnt)"))) %>%
+  select(-c(OWN_CAR_AGE, HOUR_APPR_PROCESS_START, matches("^(OBS|DEF|AMY|CNT)"))) %>%
+  colnames() 
+
+# Create data frame ----
+app_train1 <- app_train %>%
+  # Select columns from 'desired_columns.csv'
+  select(desired_columns$ColumnName) %>% 
+  # Handling numerically encoded categorical variables
+  mutate(across(c(where(is.character), all_of(num2fac)), factor), 
+         # Fixing invalid NA's
+         across(c(CODE_GENDER, ORGANIZATION_TYPE), 
+                ~case_when(. != "XNA" ~ .)),
+         # Replacing NA's in social circle columns with 0
+         across(contains("SOCIAL_CIRCLE"), ~replace_na(., 0)),
+         # Replacing NA's with 0
+         across(c(AMT_REQ_CREDIT_BUREAU_HOUR, AMT_REQ_CREDIT_BUREAU_DAY,
+                  AMT_REQ_CREDIT_BUREAU_WEEK, AMT_REQ_CREDIT_BUREAU_MON,
+                  AMT_REQ_CREDIT_BUREAU_QRT, AMT_REQ_CREDIT_BUREAU_YEAR),
+                ~replace_na(., factor("0"))),
+         # Fixing unusual `DAYS_EMPLOYED` values
+         DAYS_EMPLOYED = case_when(DAYS_EMPLOYED <= 0 ~ DAYS_EMPLOYED),
+         # Creating ordinal version of `OWN_CAR_AGE`
+         OWN_CAR_AGE2 = cut(OWN_CAR_AGE,
+                            c(0, 5, 10, 15, Inf),
+                            right = FALSE),
+         OWN_CAR_AGE2 = case_when(FLAG_OWN_CAR == "N" ~ factor("No Car Owned"),
+                                  .default = OWN_CAR_AGE2)) %>%
+  # Creating aggregate variable from the `EXT_SOURCE_*` variables
+  rowwise() %>%
+  mutate(AVG_EXT_SCORE = mean(c_across(contains("EXT_"))),
+         .after = EXT_SOURCE_3) %>%
+  ungroup() %>%
+  # Removing rows with NA's in below columns
+  filter(if_all(c(FLAG_OWN_CAR, AMT_GOODS_PRICE, AMT_ANNUITY, 
+                  CNT_FAM_MEMBERS, DAYS_LAST_PHONE_CHANGE),
+                ~!is.na(.)))
+
+# Aggregate bureau data ----
+# __ Wide version data frame
+bureau_agg_a <- bureau_df %>%
+  # Seemed to be the most relevant credit types
+  filter(CREDIT_TYPE %in% c("Consumer credit","Credit card","Car loan","Mortgage",
+                            "Microloan","Loan for business development","Another type of loan"),
+         # Ensure credit was actually given
+         AMT_CREDIT_SUM > 0,
+         # Thought this made most sense
+         CREDIT_ACTIVE %in% c("Active", "Closed"),
+         # It's unclear if they convert nominal curreny values so kept only most common
+         CREDIT_CURRENCY == "currency 1") %>%
+  # Clean credit type values to use as column names
+  mutate(CREDIT_TYPE = gsub(" +", "_", tolower(CREDIT_TYPE))) %>%
+  group_by(SK_ID_CURR, CREDIT_TYPE) %>%
+  summarise(avg_credit = mean(AMT_CREDIT_SUM),
+            # Decided that average of ratios made more sense than ratio of averages
+            avg_overage = mean(AMT_CREDIT_MAX_OVERDUE/AMT_CREDIT_SUM, na.rm = TRUE)) %>%
+  pivot_wider(names_from = CREDIT_TYPE,
+              values_from = c(avg_credit, avg_overage)) %>%
+  ungroup()
+
+# __ Version in EDA ----
+bureau_agg_b <- bureau_df %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(avg_days_credit = mean(DAYS_CREDIT, na.rm = TRUE),
+            avg_credit_day_overdue = mean(CREDIT_DAY_OVERDUE, na.rm = TRUE),
+            avg_days_credit_enddate = mean(DAYS_CREDIT_ENDDATE, na.rm = TRUE),
+            avg_amt_credit_max_overdue = mean(AMT_CREDIT_MAX_OVERDUE, na.rm = TRUE),
+            avg_cnt_credit_prolong = mean(CNT_CREDIT_PROLONG, na.rm = TRUE),
+            avg_amt_credit_sum = mean(AMT_CREDIT_SUM, na.rm = TRUE),
+            avg_amt_credit_sum_debt = mean(AMT_CREDIT_SUM_DEBT, na.rm = TRUE),
+            avg_amt_credit_sum_limit = mean(AMT_CREDIT_SUM_LIMIT, na.rm = TRUE),
+            avg_amt_credit_sum_overdue = mean(AMT_CREDIT_SUM_OVERDUE, na.rm = TRUE))
+
+#Convert bureau_agg_b$SK_ID_CURR to factor
+bureau_agg_b$SK_ID_CURR <- as.factor(bureau_agg_b$SK_ID_CURR)
+#Join app_train1 and bureau_agg_b
+app_train2 <- app_train1 %>% inner_join(bureau_agg_b)
+# Cleanup
+remove(app_train,bureau_agg_a,bureau_agg_b,bureau_df,desired_columns,num2fac)
+
+```
+This resulted in two datasets app_train1 which contained only information from the application_train.csv dataset, and app_train2 which contained the same information as app_train1, but added aggregated data from bureau.csv.
+
+In addition to this data preparation, some models required specific treatment of the data to get it into a format that was able to be utilized by that particular model.
+
+## XGBoost
+The XGBoost algorithm requires the use of a numeric matrix.  As such, categorical variables were converted into one-hot encoded dummy variables and boolean values were converted into numeric variables.  Additionally, non-informative ID variable SK_ID_CURR was removed from the matrix and saved for later analysis.
+```{r xgBoost Data Preparation, eval=FALSE}
+app_train1 <- readRDS('app_train1.RDS')
+app_train2 <- readRDS('app_train2.RDS')
+
+# Create Train and Test sets for Modeling
+set.seed(1234)
+train.index <- sample(nrow(app_train1), floor(nrow(app_train1)*0.7), replace = F)
+train_df <- app_train1[train.index,]
+test_df <- app_train1[-train.index,]
+remove(train.index, app_train1)
+
+#Verify Target variable distribution in Train and Test
+CrossTable(train_df$TARGET)
+CrossTable(test_df$TARGET)
+
+ratio <- (sum(ifelse(train_df$TARGET == '0',1,0)))/(sum(ifelse(train_df$TARGET == '1',1,0))) # Ratio Negative Response : Positive Response
+
+# Handle IDs
+id.train <- train_df$SK_ID_CURR
+id.test <- test_df$SK_ID_CURR
+target.train <- ifelse(train_df$TARGET == '1',1,0)
+target.test <- ifelse(test_df$TARGET == '1',1,0)
+train <- train_df %>% select(-c(SK_ID_CURR,TARGET,OWN_CAR_AGE)) # Add TARGET
+test <- test_df %>% select(-c(SK_ID_CURR,TARGET,OWN_CAR_AGE)) # Add TARGET
+
+# Convert Factor Variables to Numeric (Train)
+train_df <- train_df %>% select(-c(SK_ID_CURR,OWN_CAR_AGE)) # Add TARGET
+test_df <- test_df %>% select(-c(SK_ID_CURR,OWN_CAR_AGE)) # Add TARGET
+
+train_df$TARGET <- ifelse(train_df$TARGET == '1',1,0) # TARGET
+train_df$FLAG_OWN_CAR <- ifelse(train_df$FLAG_OWN_CAR == 'Y',1,0) # FLAG_OWN_CAR
+train_df$FLAG_OWN_REALTY <- ifelse(train_df$FLAG_OWN_REALTY == 'Y',1,0) # FLAG_OWN_REALTY
+for(c in 1:length(colnames(train_df))){
+  if(grepl('FLAG_',colnames(train_df)[c])){ 
+    train_df[,c] <- ifelse(train_df[,c] == '1',1,0) # Convert FLAG_ Factor columns to numeric
+  } else if (grepl('REG_', colnames(train_df)[c])) {
+    train_df[,c] <- ifelse(train_df[,c] == '1',1,0) # Convert REG_ Factor columns to numeric
+  } else if (grepl('LIVE_', colnames(train_df)[c])) {
+    train_df[,c] <- ifelse(train_df[,c] == '1',1,0) # Convert LIVE_ Factor columns to numeric
+  } else if (grepl('AMT_REQ_CREDIT_BUREAU_', colnames(train_df)[c])) {
+    train_df[c] <- lapply(train_df[c], function(x) as.numeric(as.character(x))) # Convert Credit Bureau Inquiries Columns to numeric
+  }
+}
+
+# Convert Factor Variables to Numeric (Test)
+test_df$TARGET <- ifelse(test_df$TARGET == '1',1,0) # TARGET
+test_df$FLAG_OWN_CAR <- ifelse(test_df$FLAG_OWN_CAR == 'Y',1,0) # FLAG_OWN_CAR
+test_df$FLAG_OWN_REALTY <- ifelse(test_df$FLAG_OWN_REALTY == 'Y',1,0) # FLAG_OWN_REALTY
+for(c in 1:length(colnames(test_df))){
+  if(grepl('FLAG_',colnames(test_df)[c])){ 
+    test_df[,c] <- ifelse(test_df[,c] == '1',1,0) # Convert FLAG_ Factor columns to numeric
+  } else if (grepl('REG_', colnames(test_df)[c])) {
+    test_df[,c] <- ifelse(test_df[,c] == '1',1,0) # Convert REG_ Factor columns to numeric
+  } else if (grepl('LIVE_', colnames(test_df)[c])) {
+    test_df[,c] <- ifelse(test_df[,c] == '1',1,0) # Convert LIVE_ Factor columns to numeric
+  } else if (grepl('AMT_REQ_CREDIT_BUREAU_', colnames(test_df)[c])) {
+    test_df[c] <- lapply(test_df[c], function(x) as.numeric(as.character(x))) # Convert Credit Bureau Inquiries Columns to numeric
+  }
+}
+
+#Convert remaining Factor variables to dummy variables
+dummy <- dummyVars(" ~ .", data=train_df)
+dtrain_df <- data.frame(predict(dummy, newdata=train_df))
+dummy <- dummyVars(" ~ .", data=test_df)
+dtest_df <- data.frame(predict(dummy, newdata=test_df))
+
+#Return TARGET to factor variable
+dtrain_df$TARGET <- as.factor(dtrain_df$TARGET)
+dtest_df$TARGET <- as.factor(dtest_df$TARGET)
+```
+## Data Pre-processing for Logistic Regression
+```{r}
+#Taking joined data to new variable
+data_ktrain <-app_train2
+
+#Function to calculate missing percentage
+calculate_missing_percentage <- function(data) {
+  missing_count <- colSums(is.na(data))
+  missing_percentage <- missing_count / nrow(data) * 100
+  result <- data.frame(Column = names(missing_count), Missing_Percentage = missing_percentage)
+  result$Missing_Percentage <- sprintf("%.2f%%", result$Missing_Percentage)
+  result <- result[result$Missing_Percentage != "0.00%", , drop = FALSE]
+  result <- result[order(result$Missing_Percentage, decreasing = TRUE), , drop = FALSE]
+  return(result)
+}
+
+#See missing percentage data
+print(calculate_missing_percentage(data_ktrain))
+
+# Handle missing values ----
+# Drop columns with more than 49% missing data
+missing_threshold <- 0.6
+data_ktrain_clean <- data_ktrain %>%
+    select(where(~ mean(!is.na(.)) > 1 - missing_threshold))
+
+print(calculate_missing_percentage(data_ktrain_clean))
+```
+```{r}
+#Data Imputation
+# Numeric variables
+data_ktrain_clean$avg_amt_credit_sum_limit <- ifelse(is.na(data_ktrain_clean$avg_amt_credit_sum_limit),
+                                              mean(data_ktrain_clean$avg_amt_credit_sum_limit, na.rm = TRUE),
+                                              data_ktrain_clean$avg_amt_credit_sum_limit)
+data_ktrain_clean$EXT_SOURCE_3 <- ifelse(is.na(data_ktrain_clean$EXT_SOURCE_3),
+                                   median(data_ktrain_clean$EXT_SOURCE_3, na.rm = TRUE),
+                                   data_ktrain_clean$EXT_SOURCE_3)
+data_ktrain_clean$avg_amt_credit_max_overdue <- ifelse(is.na(data_ktrain_clean$avg_amt_credit_max_overdue),
+                                                 mean(data_ktrain_clean$avg_amt_credit_max_overdue, na.rm = TRUE),
+                                                 data_ktrain_clean$avg_amt_credit_max_overdue)
+data_ktrain_clean$avg_amt_credit_sum_debt <- ifelse(is.na(data_ktrain_clean$avg_amt_credit_sum_debt),
+                                              mean(data_ktrain_clean$avg_amt_credit_sum_debt, na.rm = TRUE),
+                                              data_ktrain_clean$avg_amt_credit_sum_debt)
+data_ktrain_clean$DAYS_EMPLOYED <- ifelse(is.na(data_ktrain_clean$DAYS_EMPLOYED),
+                                    median(data_ktrain_clean$DAYS_EMPLOYED, na.rm = TRUE),
+                                    data_ktrain_clean$DAYS_EMPLOYED)
+data_ktrain_clean$avg_days_credit_enddate <- ifelse(is.na(data_ktrain_clean$avg_days_credit_enddate),
+                                              median(data_ktrain_clean$avg_days_credit_enddate, na.rm = TRUE),
+                                              data_ktrain_clean$avg_days_credit_enddate)
+
+# Categorical variables
+data_ktrain_clean$OCCUPATION_TYPE <- ifelse(is.na(data_ktrain_clean$OCCUPATION_TYPE),
+                                      levels(data_ktrain_clean$OCCUPATION_TYPE)[which.max(table(data_ktrain_clean$OCCUPATION_TYPE))],
+                                      data_ktrain_clean$OCCUPATION_TYPE)
+data_ktrain_clean$ORGANIZATION_TYPE <- ifelse(is.na(data_ktrain_clean$ORGANIZATION_TYPE),
+                                        levels(data_ktrain_clean$ORGANIZATION_TYPE)[which.max(table(data_ktrain_clean$ORGANIZATION_TYPE))],
+                                        data_ktrain_clean$ORGANIZATION_TYPE)
+data_ktrain_clean$NAME_TYPE_SUITE <- ifelse(is.na(data_ktrain_clean$NAME_TYPE_SUITE),
+                                      levels(data_ktrain_clean$NAME_TYPE_SUITE)[which.max(table(data_ktrain_clean$NAME_TYPE_SUITE))],
+                                      data_ktrain_clean$NAME_TYPE_SUITE)
+data_ktrain_clean$EXT_SOURCE_2 <- ifelse(is.na(data_ktrain_clean$EXT_SOURCE_2),
+                                         median(data_ktrain_clean$EXT_SOURCE_2, na.rm = TRUE),
+                                         data_ktrain_clean$EXT_SOURCE_2)
+
+```
+
+```{r}
+# Upsampling the data
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Split data into training and testing sets
+train_indices_glm <- sample(1:nrow(data_ktrain_clean), 0.7 * nrow(data_ktrain_clean))
+train_glm <- data_ktrain_clean[train_indices_glm, ]
+test_glm <- data_ktrain_clean[-train_indices_glm, ]
+
+# Check the class distribution of the response variable
+table(train_glm$TARGET)
+
+# Upsample the minority class (positive class) in the training data using DMwR
+train_glm_upsampled <- ovun.sample(TARGET ~ ., data = train_glm, method = "both", p = 0.5, seed = 123)$data
+
+# Verify the class distribution of the upsampled training data
+table(train_glm_upsampled$TARGET)
+
+#Excluding SK_ID_CURR column
+selected_features <- names(train_glm_upsampled)[2:86]
+selected_features <- selected_features[sapply(train_glm_upsampled[selected_features], function(x) length(unique(x))) > 1]
+
+```
+Before upsampling, the class distribution is imbalanced, with Class 0 (the majority class) having significantly more observations than Class 1 (the minority class). This class imbalance can impact the performance of the logistic regression model, as it may be biased towards the majority class.
+
+After applying upsampling, the class distribution becomes more balanced, with both classes having a similar number of observations. The upsampling technique increases the number of observations in the minority class (Class 1) to match the number of observations in the majority class (Class 0). This balanced dataset can help improve the model's ability to learn patterns and make accurate predictions for both classes.
+
+## Random Forest
+Random Forest models (at least in this package) have limits on the amount of levels in factored predictors and also don't play well with excessive numbers of NA values.
+
+```{r Random Forest Data Preparation, eval=FALSE}
+head(app_train2)
+summary(app_train2)
+
+## Removing columns with many NAs / little variation
+app_train3 <- app_train2 %>% select(-c(OWN_CAR_AGE, 
+                                       SK_ID_CURR, AVG_EXT_SCORE, EXT_SOURCE_1, avg_amt_credit_max_overdue,
+                                       FLAG_DOCUMENT_10, FLAG_DOCUMENT_11, FLAG_DOCUMENT_12,
+                                       FLAG_DOCUMENT_13, FLAG_DOCUMENT_14, FLAG_DOCUMENT_15,
+                                       FLAG_DOCUMENT_16, FLAG_DOCUMENT_17, FLAG_DOCUMENT_18,
+                                       FLAG_DOCUMENT_19, FLAG_DOCUMENT_20, FLAG_DOCUMENT_21,
+                                       FLAG_DOCUMENT_2, FLAG_DOCUMENT_3, FLAG_DOCUMENT_4,
+                                       FLAG_DOCUMENT_5, FLAG_DOCUMENT_6, FLAG_DOCUMENT_7,
+                                       FLAG_DOCUMENT_8, FLAG_DOCUMENT_9, APARTMENTS_AVG,
+                                       OBS_30_CNT_SOCIAL_CIRCLE, OBS_60_CNT_SOCIAL_CIRCLE, DEF_30_CNT_SOCIAL_CIRCLE,
+                                       DEF_60_CNT_SOCIAL_CIRCLE, WEEKDAY_APPR_PROCESS_START, HOUR_APPR_PROCESS_START,
+                                       AMT_REQ_CREDIT_BUREAU_HOUR, AMT_REQ_CREDIT_BUREAU_QRT, HOUSETYPE_MODE, OCCUPATION_TYPE, EXT_SOURCE_3,
+                                       avg_amt_credit_sum_limit, AMT_REQ_CREDIT_BUREAU_WEEK, ORGANIZATION_TYPE))
+
+#Remove empty levels
+levels(app_train3$NAME_TYPE_SUITE)[1] = "Missing"
+
+#Replace NA values w/ 0
+app_train3 <- app_train3 %>% 
+          mutate(DAYS_EMPLOYED = coalesce(DAYS_EMPLOYED, 0))
+
+skm2 <- skim(app_train3)
+# Create DF showing Columns with missing data
+skm_missing3 <- select(skm2, skim_variable, n_missing, complete_rate) %>% filter(n_missing > 0) %>% arrange(complete_rate)
+skm_missing3
+
+app_train3 <- app_train3 %>% drop_na()
+
+# split data
+rows <- nrow(app_train3)
+train.index <- sample(1:rows, floor(0.7*rows), replace=FALSE)
+dt.train <- app_train3[train.index,]
+dt.test <- app_train3[-train.index,]
+
+head(app_train3)
+summary(app_train3)
+```
+
+## Support Vector Machine
+
+Support Vector Machine (SVM) seemed like a favorable candidate given it's high potential for accuracy while still boasting good generalizability. While this may be true, run times proved to be immense, particularly when using the polynomial kernel since it generates many more dimensions (than compared to say RBF kernel) because it not only considers each feature but also their interactions to a certain degree. This can lead to a more accurate classifier if these interactions are important in your data, but it can also cause the SVM to become slow and potentially overfit if the degree of the polynomial is set too high.
+
+```{r}
+# Importing specific output for display to reduce notebook runtime
+fe_cvcomp1 <- readRDS("fe_cvcomp1.RDS")
+svm_final_confmat <- readRDS("svm_final_confmat.RDS")
+```
+
+
+```{r eval = FALSE}
+# Trimming data ----
+app_train3 <- app_train2 %>%
+  rename_with(tolower) %>%
+  filter(if_all(c(code_gender, own_car_age2, avg_ext_score, avg_amt_credit_sum), ~!is.na(.))) %>%
+  mutate(across(c(occupation_type, name_type_suite), ~replace_na(as.character(.), "unknown")),
+         across(matches("^amt_"), as.numeric),
+         code_gender = factor(code_gender, levels = c("F", "M")),
+         days_employed = replace_na(days_employed, 10),
+         organization_type = replace_na(occupation_type, "none"),
+         own_car_age = replace_na(own_car_age, -1),
+         avg_amt_credit_sum_debt = replace_na(avg_amt_credit_sum_debt, 0),
+         across(where(~any(is.na(.)) & is.numeric(.)) & !contains("avg_amt_credit_sum_debt"),
+                ~replace_na(., median(., na.rm = TRUE))),
+         across(where(~n_distinct(.) == 2),
+                ~case_when(. == .[order(.)[1]] ~ 0,
+                           .default = 1)),
+         across(where(is.factor), as.character)) %>%
+  select(-c(housetype_mode, sk_id_curr, own_car_age, flag_mobil, flag_emp_phone, flag_work_phone, 
+            weekday_appr_process_start, hour_appr_process_start, amt_req_credit_bureau_hour, 
+            amt_req_credit_bureau_day,  amt_req_credit_bureau_week,  amt_req_credit_bureau_mon,
+            amt_req_credit_bureau_qrt,  days_last_phone_change, contains("flag_document")))
+
+app_train4 <- dummyVars("~ .", app_train3) %>%
+  predict(app_train3) %>%
+  as_tibble() %>%
+  select(where(~n_distinct(.) > 1)) 
+
+# Making splits ----
+set.seed(123)
+train_index <- createDataPartition(app_train4$target, p = 0.8, list = FALSE)
+
+test_sk_id_curr <- app_train2 %>%
+  rename_with(tolower) %>%
+  filter(if_all(c(code_gender, own_car_age2, avg_ext_score, avg_amt_credit_sum), ~!is.na(.))) %>%
+  filter(!row_number() %in% train_index) %>%
+  pull(sk_id_curr)
+
+xtrain <- as.data.frame(app_train4[train_index,]) %>%
+  mutate(across(where(~n_distinct(.) == 2), factor))
+xtest <- as.data.frame(app_train4[-train_index,])  %>%
+  mutate(across(where(~n_distinct(.) == 2), factor))
+```
+
+I opted to create dummy variables since each level of each factor must be present in test/train set and every fold in k-fold cross validation. Some levels of some factors are not prevalent enough when using large k.
+
+# Modeling Process
+A variety of models were prepared for evaluation
+
+## Modeling for Logistic Regression
+```{r}
+# Fitting model 
+
+model_glm <- glm(TARGET ~ ., data = train_glm_upsampled[(selected_features)], family = "binomial")
+
+```
+```{r}
+# Get significant features
+significant_features <- summary(model_glm)$coefficients[summary(model_glm)$coefficients[, "Pr(>|z|)"] < 0.05, ]
+significant_features <- format(significant_features, scientific = FALSE)
+
+# Get significant column names
+significant_columns <- rownames(significant_features)
+
+# Check if significant column names exist in upsampled file
+existing_columns <- intersect(significant_columns, colnames(train_glm_upsampled))
+
+# Get rows for significant columns
+significant_rows <- train_glm_upsampled[, c("TARGET", existing_columns)]
+
+# Save significant rows to a new file
+write.csv(significant_rows, file = "significant_rows_upsampled.csv", row.names = FALSE)
+
+str(significant_rows)
+```
+
+```{r}
+# Read the significant_rows file
+significant_rows <- read.csv("significant_rows_upsampled.csv")
+```
+
+```{r}
+# Split the data into training and testing sets
+set.seed(123)
+train_indices_1 <- caret::createDataPartition(significant_rows$TARGET, p = 0.7, list = FALSE)
+train_data_1 <- significant_rows[train_indices_1, ]
+test_data_1 <- significant_rows[-train_indices_1, ]
+
+```
+
+```{r}
+# Fit logistic regression model on training data for significant features
+model <- glm(TARGET ~ ., data = train_data_1, family = "binomial")
+```
+
+## XGBoost
+XGBoost is a Boosted Gradient algorithm.  It has a number of user set hyperparameters that can influence model performance.  In order to determine the best hyperparameter settings for the model, a random tuning grid was utilized.  Initially, a grid with larger ranges and fewer iterations was used to evaluate if any of the hyperparameters had regions of the grid that appeared to yield better performance.  Once the grid was refined, a final tuning run was made to yield the best performing model on the data.  The gamma hyperparameter was not utilized as it is more effective with smaller trees than the model eventually utilized.
+
+```{r XGBoost Hyperparameter Tuning, eval=FALSE}
+# Set up Tasks
+trainTask <- makeClassifTask(data = dtrain_df, target = 'TARGET')
+testTask <- makeClassifTask(data = dtest_df, target = 'TARGET')
+
+# one-hot encoding
+trainTask <- createDummyFeatures(obj = trainTask)
+testTask <- createDummyFeatures(obj = testTask)
+
+# Create Learner
+lrn <- makeLearner('classif.xgboost', predict.type = 'response')
+lrn$par.vals <- list(objective = 'binary:logistic',
+                     booster = 'gbtree',
+                     eval_metric = 'error'
+                     )
+makeWeightedClassesWrapper(lrn,wcw.weight = ratio)
+
+# Set Hyperparameter Space
+params <- makeParamSet(makeIntegerParam('max_depth', lower = 8, upper = 9),
+                       makeIntegerParam('nrounds', lower = 200, upper = 500),
+                       makeNumericParam('min_child_weight', lower = 5, upper = 10),
+                       makeNumericParam('subsample', lower = 0.5, upper = 0.8),
+                       makeNumericParam('colsample_bytree', lower = 0.7, upper = 1),
+                       makeNumericParam('eta', lower = 0.1, upper = 0.4))
+
+# Set resampling
+rdesc <- makeResampleDesc('CV', stratify = F, iters = 5)
+
+# Set search
+ctrl <- makeTuneControlRandom(maxit = 25)
+
+# Set up Parallel Processing
+parallelStartSocket(cpus = detectCores())
+
+# Tuning
+tune <- tuneParams(learner = lrn, 
+                   task = trainTask,
+                   resampling = rdesc,
+                   measures = fpr,
+                   par.set = params,
+                   control = ctrl,
+                   show.info = T)
+```
+
+### Hyperparameters
+Hyperparameter tuning took several hours running in parallel on 16 cpus.  The models were scored on performance in minimizing the FPR measure, as the minimization of Type II errors was determined to be paramount to model performance based on business objectives.
+
+The selected hyperparameters were as follows:  
+max_depth = 8  
+nrounds = 280  
+min_child_weight = 6.96752  
+subsample = 0.5409828  
+colsample_bytree = 0.7388845  
+eta = 0.3878024  
+
+```{r train tuned xgBoost model, eval=FALSE}
+# Select Hyperparameters from the best model
+lrn.tune <- setHyperPars(lrn, par.vals = tune$x)
+
+# Train the model using selected hyperparameters
+xgb.model <- train(learner = lrn.tune,
+                task = trainTask)
+```
+### Benchmarking
+Training the model using the selected hyperparameters was benchmarked and averaged 285s per training run.
+
+## Random Forest
+Random Forest used to model the relationship between a binary dependent variable "TARGET" variable all the other variables in the dt.train dataset. Several hyperparameters and tunings were evaluated throughout this process.
+
+### Fit + Tune Random Forest Model
+```{r Random Forest, echo=TRUE, eval=FALSE}
+# Normal Random Forest
+set.seed(300)
+rf <- randomForest(TARGET ~ ., data = dt.train)
+rf
+
+# Auto-tuned Random Forest
+# ctrl <- trainControl(method = "repeatedcv",
+                     # number = 5, repeats = 5)
+
+# grid_rf <- expand.grid(.mtry = c(2, 8))
+
+# tuned_rf <- caret::train(TARGET ~ ., data = dt.train, method = "rf",
+                  # metric = "Kappa", trControl = ctrl,
+                  # tuneGrid = grid_rf)
+
+# tuned_rf
+
+# I was able to process the model above after leaving it run for over 48 hours. However, after saving the model, it is over 100MB and too big to add to git. I still tested it on my local machine.
+```
+
+### Save the Random Forest Model
+```{r Save Model, echo=FALSE}
+saveRDS(rf, "rf.rds")
+# saveRDS(tuned_rf, "tuned_rf.rds")
+```
+
+## Support Vector Machine
+
+### Custom ksvm Cross Validation Function
+
+```{r}
+ksvm_cv <- \(df, tv, kern, c = 1, n_folds = 1, seed = 123, give.model = TRUE){
+  if (n_folds > 1) {
+    set.seed(seed)
+    folds <- createFolds(pull(df, {{tv}}), n_folds)
+    
+    cv_res <- lapply(folds, \(x){
+      test <- df[x,]
+      train <- df[-x,]
+      
+      fmodel <- ksvm(pull(train, {{tv}}) ~ ., data = train, kernel = kern, C = c)
+      fpred <- predict(fmodel, test)
+      
+      cm <- confusionMatrix(fpred, pull(test, {{tv}}))
+      
+      return(c(cm$overall[1], cm$byClass))
+    })
+    
+    perf_df <- tibble(cv_res) %>%
+      unnest_wider(cv_res) %>%
+      summarise(across(everything(),
+                       list(avg = ~mean(., na.rm = TRUE),
+                            sd = ~sd(., na.rm = TRUE)))) %>%
+      pivot_longer(everything(),
+                   names_to = c(".value", "stat"),
+                   names_pattern = "(.*)_(.*)")
+    
+    return(perf_df)
+  } else {
+    train <- df
+    
+    fmodel <- ksvm(pull(train, {{tv}}) ~ ., data = train, kernel = kern, C = c)
+    fpred <- predict(fmodel, train)
+    
+    cm <- confusionMatrix(fpred, pull(train, {{tv}}))
+    
+    if(give.model){
+      return(
+        list(
+          perf_metrics = c(cm$overall[1], cm$byClass),
+          confmat = cm,
+          preds = fpred,
+          ksvm_model = fmodel
+        )
+      )
+    } else {
+      return(
+        list(
+          perf_metrics = c(cm$overall[1], cm$byClass),
+          confmat = cm,
+          preds = fpred
+        )
+      )
+    }
+  }
+}
+```
+
+### Parallel Cross Validation
+
+```{r eval = FALSE}
+# Parameter grid for two different kernels
+kgrid <- expand.grid(kernel = c("polydot"),
+                     C = c(0.01, 2, 3)
+) %>%
+  bind_rows(expand.grid(kernel = c("rbfdot"),
+                        C = c(1, 5, 20, 60, 200)
+  )) %>%
+  as_tibble() %>%
+  mutate(kernel = as.character(kernel))
+
+# Use smaller sample to decrease outrageous run times
+set.seed(123)
+che <- xtrain %>%
+  slice_sample(n = 20000)
+
+cl <- makeCluster(8)
+registerDoParallel(cl)
+
+(xtime1 <- Sys.time())
+fe_cvcomp <- foreach(i = 1:nrow(kgrid), .packages = c("tidyverse", "caret", "kernlab"), .combine = "bind_rows", .verbose = TRUE) %dopar% {
+  fetime1 <- Sys.time()
+  x <- ksvm_cv(che, target, kern = kgrid$kernel[i], c = kgrid$C[i], n_folds = 5, give.model = FALSE)
+  fetime2 <- Sys.time()
+  ttime <- fetime2 - fetime1
+  
+  xdf <- tibble(kernel = kgrid$kernel[i],
+                C = kgrid$C[i],
+                sec = as.numeric(ttime, units = "secs"),
+                x)
+  
+  xdf
+}
+xtime2 <- Sys.time()
+
+stopCluster(cl)
+(the_time <- xtime2 - xtime1)
+
+fe_cvcomp1 <- fe_cvcomp %>%
+  mutate(mins = sec/60,
+         .after = sec) 
+```
+
+```{r}
+fe_cvcomp1
+```
+
+### 8 Fold Majority Class Classifier
+
+Through the tuning process, I learned very quickly that SVM is very computationally expensive. To solve this I cut the train set into 8 folds, made 8 models and predictions and the majority prediction became the final prediction. In the case of a tie, the prediction is set to 0 since it's the majority class for the dataset.
+
+```{r eval = FALSE}
+set.seed(123)
+train_folds <- createFolds(xtrain$target, 8)
+
+cl <- makeCluster(8)
+registerDoParallel(cl)
+
+(xtime1 <- Sys.time())
+mmc <- foreach(i = 1:8, .packages = c("tidyverse", "caret", "kernlab"), .combine = "c") %dopar% {
+  xdf <- xtrain[train_folds[[i]], ]
+  
+  xmodel <- ksvm(target ~ ., data = xdf, kernel = "polydot", C = 3)
+  xpreds <- predict(xmodel, xtest)
+  
+  xlist <- list(fold = i, model = xmodel, preds = xpreds)
+  
+  xlist
+  
+}
+xtime2 <- Sys.time()
+(ttime <- xtime2 - xtime1)
+
+stopCluster(cl)
+
+final_preds <- tibble(x1 = names(mmc),
+                      x2 = mmc) %>%
+  filter(x1 == "preds") %>%
+  mutate(x1 = paste0(x1, row_number())) %>%
+  pivot_wider(names_from = x1,
+              values_from = x2) %>%
+  unnest(cols = c(preds1:preds8)) %>%
+  rowwise() %>%
+  mutate(n0 = sum(c_across(preds1:preds8) == 0)) %>%
+  ungroup() %>%
+  mutate(pred = case_when(n0 >= 4 ~ 0,
+                          .default = 1),
+         sk_id_curr = test_sk_id_curr) %>%
+  select(sk_id_curr, pred)
+
+
+```
+
+
+# Model Performance
+
+## Model Performance for Logistic regression
+```{r}
+# Predict probabilities for training and testing data
+train_probs <- predict(model, train_data_1, type = "response")
+test_pred <- predict(model, test_data_1, type = "response")
+
+# Convert predicted values to factors with the same levels as the target variable
+pred <- as.factor(ifelse(test_pred > 0.5, "1", "0"))
+
+# Convert the actual target variable to a factor with the same levels
+actual <- as.factor(test_data_1$TARGET)
+
+# Calculate the confusion matrix
+confusionMatrix(pred, actual)
+
+```
+
+```{r}
+# Calculate AUC scores
+train_auc_glm <- roc(train_data_1$TARGET, train_probs)$auc
+test_auc_glm <- roc(test_data_1$TARGET, test_pred)$auc
+
+# Display the AUC scores
+output <- data.frame(
+    Model = "Logistic Regression",
+    "Training AUC" = train_auc_glm,
+    "Testing AUC" = test_auc_glm
+)
+print(output)
+```
+
+```{r}
+# Plt ROC Curve
+# Calculate FPR, TPR, and thresholds
+roc_data <- roc(test_data_1$TARGET, test_pred)
+fpr <- roc_data$specificities
+tpr <- roc_data$sensitivities
+thresholds <- roc_data$thresholds
+
+# Calculate AUC
+auc <- auc(roc_data)
+
+# Plot ROC curve
+ggplot() +
+    geom_line(data = data.frame(fpr = 1-fpr, tpr = tpr), aes(x = fpr, y = tpr), color = "darkorange") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "navy") +
+    scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+    scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+    labs(title = "ROC curve",
+         x = "FPR",
+         y = "TPR") +
+    annotate(
+        "text", x = 0.6, y = 0.2,
+        label = paste0("AUC = ", round(auc, 3)),
+        color = "darkorange"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 20),
+          axis.title = element_text(size = 15))
+
+```
+```{r}
+# Create display_importances function
+display_importances <- function(feature_importance_df_) {
+    feature_importance_df_ <- feature_importance_df_ %>%
+        arrange(desc(importance))
+    
+    plt <- ggplot(feature_importance_df_, aes(x = importance, y = reorder(feature, importance, max))) +
+        geom_bar(stat = "identity", fill = "steelblue") +
+        labs(title = "Variable Importance",
+             x = "Importance",
+             y = "Feature") +
+        theme_minimal()
+    
+    print(plt)
+}
+
+# Get the important feature names
+important_features <- colnames(significant_rows)[-1]
+
+# Calculate the importance values based on the number of features
+importance_values <- 1:length(important_features)
+
+# Create the feature_importance_df data frame
+feature_importance_df <- data.frame(
+    feature = important_features,
+    importance = importance_values
+)
+
+# Call the display_importance function to get variable importance plot
+display_importances(feature_importance_df)
+```
+
+Based on the analysis of the logistic regression model, the variables avg_amt_credit_sum_debt have the most significant impact on the outcome values. These variables, along with the credit_sum and max_overdue, play an important role in predicting the outcomes.
+
+In addition to the external data sources, other important variables for predicting outcomes include the days_employed and days_birth.
+
+
+```{r load saved models, echo=FALSE}
+# Load Saved Models
+xgb.model <- readRDS('best_model_tuned2.xgb')
+rf.model <- readRDS('rf.rds')
+# trf.model <- readRDS('tuned_rf.rds')
+# From this point forward code will be evaluated during Knitting operations ####
+```
+## XGBoost Model Performance
+```{r hidden data prep, echo=FALSE}
+app_train1 <- readRDS('app_train2.RDS')
+
+# Create Train and Test sets for Modeling
+set.seed(1234)
+train.index <- sample(nrow(app_train1), floor(nrow(app_train1)*0.7), replace = F)
+train_df <- app_train1[train.index,]
+test_df <- app_train1[-train.index,]
+remove(train.index, app_train1)
+# Ratio Negative Response : Positive Response
+ratio <- (sum(ifelse(train_df$TARGET == '0',1,0)))/(sum(ifelse(train_df$TARGET == '1',1,0))) 
+
+# Handle IDs
+id.train <- train_df$SK_ID_CURR
+id.test <- test_df$SK_ID_CURR
+target.train <- ifelse(train_df$TARGET == '1',1,0)
+target.test <- ifelse(test_df$TARGET == '1',1,0)
+
+# Convert Factor Variables to Numeric (Train)
+train_df <- train_df %>% select(-c(SK_ID_CURR,OWN_CAR_AGE)) # Add TARGET
+test_df <- test_df %>% select(-c(SK_ID_CURR,OWN_CAR_AGE)) # Add TARGET
+
+train_df[77:85] <- train_df[77:85] %>% replace(is.na(.), 0) # Replace NaN values
+test_df[77:85] <- test_df[77:85] %>% replace(is.na(.), 0) # Replace NaN values
+train_df <- train_df %>%
+  mutate(AVG_EXT_SCORE = replace_na(AVG_EXT_SCORE, 0))
+test_df <- test_df %>%
+  mutate(AVG_EXT_SCORE = replace_na(AVG_EXT_SCORE, 0))
+train_df$TARGET <- ifelse(train_df$TARGET == '1',1,0) # TARGET
+train_df$FLAG_OWN_CAR <- ifelse(train_df$FLAG_OWN_CAR == 'Y',1,0) # FLAG_OWN_CAR
+train_df$FLAG_OWN_REALTY <- ifelse(train_df$FLAG_OWN_REALTY == 'Y',1,0) # FLAG_OWN_REALTY
+for(c in 1:length(colnames(train_df))){
+  if(grepl('FLAG_',colnames(train_df)[c])){ 
+    train_df[,c] <- ifelse(train_df[,c] == '1',1,0) # Convert FLAG_ Factor columns to numeric
+  } else if (grepl('REG_', colnames(train_df)[c])) {
+    train_df[,c] <- ifelse(train_df[,c] == '1',1,0) # Convert REG_ Factor columns to numeric
+  } else if (grepl('LIVE_', colnames(train_df)[c])) {
+    train_df[,c] <- ifelse(train_df[,c] == '1',1,0) # Convert LIVE_ Factor columns to numeric
+  } else if (grepl('AMT_REQ_CREDIT_BUREAU_', colnames(train_df)[c])) {
+    train_df[c] <- lapply(train_df[c], function(x) as.numeric(as.character(x))) # Convert Credit Bureau Inquiries Columns to numeric
+  }
+}
+
+# Convert Factor Variables to Numeric (Test)
+test_df$TARGET <- ifelse(test_df$TARGET == '1',1,0) # TARGET
+test_df$FLAG_OWN_CAR <- ifelse(test_df$FLAG_OWN_CAR == 'Y',1,0) # FLAG_OWN_CAR
+test_df$FLAG_OWN_REALTY <- ifelse(test_df$FLAG_OWN_REALTY == 'Y',1,0) # FLAG_OWN_REALTY
+for(c in 1:length(colnames(test_df))){
+  if(grepl('FLAG_',colnames(test_df)[c])){ 
+    test_df[,c] <- ifelse(test_df[,c] == '1',1,0) # Convert FLAG_ Factor columns to numeric
+  } else if (grepl('REG_', colnames(test_df)[c])) {
+    test_df[,c] <- ifelse(test_df[,c] == '1',1,0) # Convert REG_ Factor columns to numeric
+  } else if (grepl('LIVE_', colnames(test_df)[c])) {
+    test_df[,c] <- ifelse(test_df[,c] == '1',1,0) # Convert LIVE_ Factor columns to numeric
+  } else if (grepl('AMT_REQ_CREDIT_BUREAU_', colnames(test_df)[c])) {
+    test_df[c] <- lapply(test_df[c], function(x) as.numeric(as.character(x))) # Convert Credit Bureau Inquiries Columns to numeric
+  }
+}
+
+#Convert remaining Factor variables to dummy variables
+dummy <- dummyVars(" ~ .", data=train_df)
+dtrain_df <- data.frame(predict(dummy, newdata=train_df))
+dummy <- dummyVars(" ~ .", data=test_df)
+dtest_df <- data.frame(predict(dummy, newdata=test_df))
+
+#Return TARGET to factor variable
+dtrain_df$TARGET <- as.factor(dtrain_df$TARGET)
+dtest_df$TARGET <- as.factor(dtest_df$TARGET)
+
+# Set up Tasks
+trainTask <- makeClassifTask(data = dtrain_df, target = 'TARGET')
+testTask <- makeClassifTask(data = dtest_df, target = 'TARGET')
+```
+
+XGBoost model was used to predict the classification of applications as No Default = 0 or Default = 1.  No Default (TARGET = 0) was defined as a positive prediction for the purposes of analysis.
+
+```{r xgboost performance analysis}
+# Predict classification on test split of app_train2
+xgb.pred <- predict(xgb.model,testTask)
+# ConfusionMatrix of prediction results
+confusionMatrix(xgb.pred$data$response,xgb.pred$data$truth)
+```
+
+Two metrics were examined for model comparison based upon business objectives.  Specificity (TNR) and Recall (TPR) were computed. TPR was most informative as it is the complement of miss rate (FNR) which was the measure we sought to minimize.
+
+```{r FPR and TNR: XGBoost}
+TP <- 71398
+TN <- 597
+FN <- 5550
+FP <- 1431
+
+TPR <- TP / ( TP + FP )
+TNR <- TN / ( TN + FN )
+```
+
+The model resulted in a Recall(TPR) = `r TPR` and Specificity(TNR) = `r TNR`.
+
+## Random Forest Model Performance
+```{r Explore Performance, echo=TRUE, eval=FALSE}
+varImpPlot(rf.model)
+
+predicted <- predict(rf.model, dt.test)
+# tpredicted <- predict(trf.model, dt.test)
+
+table(predicted, dt.test$TARGET)
+# table(tpredicted, dt.test$TARGET)
+# tpredicted     0     1
+#          0 70054  2353
+#          1     0  3406
+
+rf_TP <- 69926
+rf_TN <- 6
+rf_FN <- 5876
+rf_FP <- 5
+
+rf_TPR <- rf_TP / ( rf_TP + rf_FP )
+rf_TNR <- rf_TN / ( rf_TN + rf_FN )
+
+rf_TPR
+rf_TNR
+
+rf.model
+# trf.model
+```
+
+The model identified EXT_SOURCE_2, avg_days_credit, and avg_days_credit_enddate to be important. However, the model is extremely unspecific based on its TNR. The model did perform slightly better on the training dataset. It is likely overfitting and will need to have some parameters tweaked. The tuned model performed a little better, but not enough to warrant the extra processing time and size.
+
+## Support Vector Machine
+
+```{r eval = FALSE}
+svm_final_confmat <- confusionMatrix(factor(final_preds$pred), xtest$target)
+```
+
+Given the business case, it seems wise to optimize around maximizing Specificity (if target class = 0) since the cost of default likely far exceeds the opportunity cost of a new customer. This model finished with an unimpressive 86.3% accuracy and a surprisingly hard to achieve 9.75% Specificity.
+
+```{r}
+svm_final_confmat
+```
+
+
+# Results
+
+Though the SVM model yielded the highest Specificity, the XGB model's Specificity was not far behind and boasted a superior overall accuracy. This is the model we would propose to move forward with and also the model we submitted to Kaggle. The public score it received was 0.5211.
+
+The common pain point expressed through this process was the sheer volume of the data. Realizing exactly how to trim the data occurs only after modeling begins and any trimming during even an extensive EDA is to some degree assumptive. With a smaller and tidier data set, more hyperparameter tuning and other experimentation can be done which ideally results in more predictive models.
+
+# Contributions
+* Roman Brock
+    + Random Forest
+* Che Diaz Fadel
+    + Support Vector Machine
+* Kalyani Joshi
+    + Logistic Regression
+* Chris Porter
+    + XGBoost
+
